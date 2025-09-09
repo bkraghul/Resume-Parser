@@ -1,1 +1,5 @@
-pip install -r requirements.txt
+# Install necessary libraries
+!pip install pdfplumber spacy transformers
+
+# Download a spaCy model
+!python -m spacy download en_core_web_sm
