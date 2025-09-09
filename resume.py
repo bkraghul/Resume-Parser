@@ -1,265 +1,224 @@
-import pdfplumber # type: ignore
+"""
+Resume Parser (ML/NLP based, local only)
+---------------------------------------
+- Uses spaCy for NER (names, orgs, locations, dates)
+- Uses regex + heuristics for emails, phones, skills
+- Supports PDF, DOCX, TXT
+- Outputs structured JSON
+"""
+
 import re
 import json
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import List, Optional
+
+import pdfplumber
+import docx
+import spacy
 
 # -----------------------------
-# 1. Extract text from PDF
+# Load spaCy NLP model
 # -----------------------------
-def extract_text_from_pdf(pdf_path):
-    text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            text += page_text + "\n"
+# Load the spaCy model, handling potential errors if not installed
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    print("Please install spaCy English model: python -m spacy download en_core_web_sm")
+    nlp = None
 
-    # Clean up symbols and formatting
-    repls = {
-        "\uf0d8": " ",
-        "•": " ",
-        "": " ",
-        "": " ",
-        "–": "-",
-        "—": "-",
-        "\xa0": " ",
-        "\u200b": "",
-    }
-    for k, v in repls.items():
-        text = text.replace(k, v)
-
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-def get_lines(text):
-    return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
 # -----------------------------
-# 2. Personal details
+# Regex patterns
 # -----------------------------
-def extract_personal_details(text):
-    # Email
-    email = None
-    m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
-    if m: email = m.group(0)
+EMAIL_RX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_RX = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
+LINKEDIN_RX = re.compile(r"(https?://)?(www\.)?linkedin\.com/in/[A-Za-z0-9\-_%]+")
+YEAR_RX = re.compile(r"(19|20)\d{2}")
 
-    # Phone
-    phone = None
-    pm = re.search(r"(?:\+\d{1,3}\s*)?(?:\d[\s-]?){9,12}", text)
-    if pm: phone = pm.group(0).strip()
+COMMON_SKILLS = {
+    "python","java","c++","c#","javascript","typescript","react","angular","vue",
+    "node","sql","mysql","postgresql","mongodb",
+    "aws","azure","gcp","docker","kubernetes","linux","git",
+    "django","flask","spring","fastapi","pandas","numpy","matplotlib","seaborn",
+    "tensorflow","pytorch","nlp","machine learning","deep learning","html","css"
+}
 
-    # Name = top candidate near top
-    lines = get_lines(text)
+# -----------------------------
+# Data classes
+# -----------------------------
+@dataclass
+class Contact:
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    linkedin: Optional[str] = None
+    location: Optional[str] = None
+
+@dataclass
+class Education:
+    degree: Optional[str] = None
+    institution: Optional[str] = None
+    years: Optional[str] = None
+
+@dataclass
+class Experience:
+    title: Optional[str] = None
+    company: Optional[str] = None
+    years: Optional[str] = None
+    description: Optional[str] = None
+
+@dataclass
+class Resume:
+    contact: Contact
+    education: List[Education]
+    experience: List[Experience]
+    skills: List[str]
+
+# -----------------------------
+# Text Extraction
+# -----------------------------
+def extract_text_from_pdf(path: str) -> str:
+    try:
+        text_parts = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text()
+                if txt:
+                    text_parts.append(txt)
+        return "\n".join(text_parts).strip()
+    except ImportError:
+        print("pdfplumber not installed. Please install it using: !pip install pdfplumber")
+        return ""
+    except Exception as e:
+        print(f"Error extracting text from PDF: {e}")
+        return ""
+
+
+def extract_text_from_docx(path: str) -> str:
+    try:
+        doc = docx.Document(path)
+        return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+    except ImportError:
+        print("python-docx not installed. Please install it using: !pip install python-docx")
+        return ""
+    except Exception as e:
+        print(f"Error extracting text from DOCX: {e}")
+        return ""
+
+
+def extract_text(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext == ".pdf":
+        return extract_text_from_pdf(path)
+    elif ext == ".docx":
+        return extract_text_from_docx(path)
+    elif ext == ".txt":
+        try:
+            return Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            print(f"Error reading text file: {e}")
+            return ""
+    else:
+        print(f"Unsupported file type: {ext}")
+        return ""
+
+# -----------------------------
+# Extraction Functions
+# -----------------------------
+def extract_contact(text: str) -> Contact:
+    email_match = EMAIL_RX.search(text)
+    phone_match = PHONE_RX.search(text)
+    linkedin_match = LINKEDIN_RX.search(text)
+
+    doc = nlp(text[:1000])  # only first part for speed
     name = None
-    for ln in lines[:10]:
-        if len(ln) < 40 and re.search(r"[A-Za-z]", ln) and not re.search(r"@|www|http", ln):
-            name = ln
-            break
+    location = None
+    for ent in doc.ents:
+        if not name and ent.label_ == "PERSON":
+            name = ent.text
+        if not location and ent.label_ in ("GPE","LOC"):
+            location = ent.text
 
-    # Links
-    linkedin = None
-    behance = None
-    lm = re.search(r"(https?://[^\s]+linkedin[^\s]+)", text, re.I)
-    if lm: linkedin = lm.group(1)
-    bm = re.search(r"(https?://[^\s]*behance[^\s]+)", text, re.I)
-    if bm: behance = bm.group(1)
-
-    return {
-        "name": name,
-        "email": email,
-        "phone": phone,
-        "links": {
-            "linkedin": linkedin,
-            "behance": behance
-        }
-    }
-
-# -----------------------------
-# 3. Education parser
-# -----------------------------
-def parse_education(text):
-    lines = get_lines(text)
-    edu = []
-    capture = False
-    for ln in lines:
-        if re.search(r"education", ln, re.I):
-            capture = True
-            continue
-        if capture:
-            if re.search(r"(work experience|skills|objective|references)", ln, re.I):
-                break
-            if re.search(r"(Diploma|Degree|Course|Certificate|SSLC|PUC|B\.|M\.)", ln, re.I) or re.search(r"\b(20\d{2}|19\d{2})\b", ln):
-                years = re.findall(r"\b(?:19|20)\d{2}\b", ln)
-                start_y, end_y = None, None
-                if len(years) >= 2:
-                    start_y, end_y = years[0], years[1]
-                elif len(years) == 1:
-                    end_y = years[0]
-                edu.append({
-                    "details": ln.strip(),
-                    "start_year": start_y,
-                    "end_year": end_y
-                })
-    return edu
-
-# -----------------------------
-# 4. Work experience parser
-# -----------------------------
-import re
-
-MONTHS = r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-
-def find_date_range(s: str):
-    s = s.replace("–","-").replace("—","-")
-    m = re.search(fr"{MONTHS}\s+\d{{4}}\s*[-to]+\s*(?:{MONTHS}\s+\d{{4}}|Present)", s, re.I)
-    if m:
-        parts = re.split(r"[-to]+", m.group(0))
-        if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
-    all_my = re.findall(fr"{MONTHS}\s+\d{{4}}|Present", s, re.I)
-    if len(all_my) >= 2:
-        return all_my[0], all_my[1]
-    if len(all_my) == 1:
-        return all_my[0], None
-    return None, None
-
-def extract_project_details(block, company):
-    title_match = re.search(r"Title\s*:\s*(.+)", block)
-    title = title_match.group(1).strip() if title_match else None
-
-    duration_match = re.search(
-        r"Duration\s*:\s*([A-Za-z]+\s*\d{4})\s*[-–]\s*([A-Za-z]+\s*\d{4}|Present)",
-        block
+    return Contact(
+        name=name,
+        email=email_match.group(0) if email_match else None,
+        phone=phone_match.group(0) if phone_match else None,
+        linkedin=linkedin_match.group(0) if linkedin_match else None,
+        location=location
     )
-    start_date, end_date = None, None
-    if duration_match:
-        start_date = duration_match.group(1)
-        end_date = duration_match.group(2)
 
-    role_match = re.search(
-        r"(Technical Lead|Team Lead|Senior Engineer|Engineer|Developer|Manager|Designer|UI/UX Designer|Graphic Designer)",
-        block, re.IGNORECASE
-    )
-    role = role_match.group(1) if role_match else None
+def extract_education(text: str) -> List[Education]:
+    lines = text.splitlines()
+    education = []
+    for line in lines:
+        if any(word in line.lower() for word in ["university","college","institute","school","bachelor","master","phd","mba"]):
+            years = " - ".join(YEAR_RX.findall(line)) if YEAR_RX.findall(line) else None
+            degree = None
+            for keyword in ["bachelor","master","phd","mba","b.sc","m.sc","b.tech","m.tech"]:
+                if keyword in line.lower():
+                    degree = keyword.upper()
+                    break
+            education.append(Education(degree=degree, institution=line.strip(), years=years))
+    return education
 
-    return {
-        "company": company,
-        "project_title": title,
-        "role": role,
-        "start_date": start_date,
-        "end_date": end_date,
-        "details": block.strip()
-    }
+def extract_experience(text: str) -> List[Experience]:
+    lines = text.splitlines()
+    experience = []
+    for line in lines:
+        if any(word in line.lower() for word in ["intern","engineer","developer","manager","consultant","analyst","lead"]):
+            years = " - ".join(YEAR_RX.findall(line)) if YEAR_RX.findall(line) else None
+            experience.append(Experience(title=line.strip(), company=None, years=years, description=line.strip()))
+    return experience
 
-import re
-
-MONTHS = r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
-
-def find_date_range(s: str):
-    """Extract start and end date (month year - month year / Present)."""
-    s = s.replace("–", "-").replace("—", "-")
-    m = re.search(fr"{MONTHS}\s+\d{{4}}\s*[-to]+\s*(?:{MONTHS}\s+\d{{4}}|Present)", s, re.I)
-    if m:
-        parts = re.split(r"[-to]+", m.group(0))
-        if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
-    all_my = re.findall(fr"{MONTHS}\s+\d{{4}}|Present", s, re.I)
-    if len(all_my) >= 2:
-        return all_my[0], all_my[1]
-    if len(all_my) == 1:
-        return all_my[0], None
-    return None, None
-
-def parse_experience(text):
-    """Parse work experience from resumes with 'Professional Experience' or 'Work Experience'."""
-    lines = text.split("\n")
-    experiences = []
-    capture = False
-    block = []
-
-    # --- Step 1: Capture the Experience Section ---
-    for ln in lines:
-        if re.search(r"(work experience|professional experience)", ln, re.I):
-            capture = True
-            continue
-        if capture:
-            if re.search(r"(education|skills|objective|references)", ln, re.I):
-                break
-            if ln.strip():
-                block.append(ln.strip())
-
-    if not block:
-        return []
-
-    # --- Step 2: Join the section into text ---
-    section_text = " ".join(block)
-
-    # --- Step 3: Split by company keywords or role patterns ---
-    jobs = re.split(r"(?=Stress Engineer|Design Engineer|Software Engineer|UI/UX Designer|Developer|Manager)", section_text, flags=re.I)
-
-    for job in jobs:
-        job = job.strip()
-        if not job:
-            continue
-        start, end = find_date_range(job)
-
-        # Role
-        role = None
-        m = re.search(r"(Stress Engineer|Design Engineer|UI/UX Designer|Graphic Designer|Developer|Manager)", job, re.I)
-        if m: role = m.group(1)
-
-        # Company
-        company = None
-        m = re.search(r"(Capgemini|Quest Global|TCS|Infosys|Wipro|Accenture|Cognizant)", job, re.I)
-        if m: company = m.group(1)
-
-        experiences.append({
-            "company": company,
-            "role": role,
-            "start_date": start,
-            "end_date": end,
-            "details": job
-        })
-
-    return experiences
-
-
-def parse_skills(text):
-    lines = text.split("\n")
-    skills = []
-    capture = False
-    for ln in lines:
-        if re.search(r"(skills|toolkit|languages)", ln, re.I):
-            capture = True
-            continue
-        if capture and re.search(r"(experience|education|objective|references)", ln, re.I):
-            break
-        if capture:
-            parts = re.split(r"[,/|;•\-]", ln)
-            for p in parts:
-                if p.strip():
-                    skills.append(p.strip())
-    return list(dict.fromkeys(skills))  # deduplicate
+def extract_skills(text: str) -> List[str]:
+    text_lower = text.lower()
+    found = set()
+    for skill in COMMON_SKILLS:
+        if re.search(r"\b" + re.escape(skill.lower()) + r"\b", text_lower):
+            found.add(skill)
+    return sorted(found)
 
 # -----------------------------
-# 6. Build JSON
+# Main parse function
 # -----------------------------
-def build_resume_json(text):
+def parse_resume(path: str) -> dict:
+    text = extract_text(path)
+    if not text:
+        return {}
+    contact = extract_contact(text)
+    education = extract_education(text)
+    experience = extract_experience(text)
+    skills = extract_skills(text)
+
+    resume = Resume(contact=contact, education=education, experience=experience, skills=skills)
     return {
-        "personal_details": extract_personal_details(text),
-        "education": parse_education(text),
-        "work_experience": parse_experience_blocks(text), # type: ignore
-        "skills": parse_skills(text)
+        "contact": asdict(resume.contact),
+        "education": [asdict(e) for e in resume.education],
+        "experience": [asdict(e) for e in resume.experience],
+        "skills": resume.skills
     }
 
 # -----------------------------
-# 7. Main
+# Main execution block for Colab
 # -----------------------------
+
+# Replace with your PDF path
+# Use different resume files to test robustness
+resume_file_path = '/content/Naukri_YogeshPopatChungde[2y_10m].pdf'
+
+
+
 if __name__ == "__main__":
-    pdf_path = "/content/ex1 resume.pdf"  # replace with your file path
-    text = extract_text_from_pdf(pdf_path)
-    resume_json = build_resume_json(text)
+    # This block is intended for standalone script execution.
+    # When running in Colab, the code outside this block will be executed directly.
+    # We will move the execution logic outside this block for Colab compatibility.
+    pass # Keep the __main__ block empty or remove it if preferred.
 
-    print(json.dumps(resume_json, indent=2, ensure_ascii=False))
-
-    with open("resume_output.json", "w", encoding="utf-8") as f:
-        json.dump(resume_json, f, indent=2, ensure_ascii=False)
+# --- Move execution logic here for Colab ---
+# Check if nlp model was loaded successfully
+if nlp:
+    result = parse_resume(resume_file_path)
+    print(json.dumps(result, indent=2))
+else:
+    print("spaCy NLP model not loaded. Please address the loading issue.")
